@@ -44,3 +44,31 @@ jobs:
           name: goutoujunshi-ios-simulator-preview
           path: integrations/jev_ios/build/goutoujunshi-ios-simulator-preview.zip
           if-no-files-found: error
+      - name: Package unsigned iPhone IPA with extensions
+        run: |
+          set -euo pipefail
+          APP="build-device/Build/Products/Debug-iphoneos/GoutouJunshi.app"
+          test -d "$APP/PlugIns/GoutouKeyboard.appex"
+          test -d "$APP/PlugIns/GoutouCapture.appex"
+          for BUNDLE in "$APP" "$APP"/PlugIns/*.appex; do
+            PLATFORM=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleSupportedPlatforms:0' "$BUNDLE/Info.plist")
+            test "$PLATFORM" = "iPhoneOS"
+            EXECUTABLE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$BUNDLE/Info.plist")
+            test -x "$BUNDLE/$EXECUTABLE"
+            lipo -verify_arch arm64 "$BUNDLE/$EXECUTABLE"
+          done
+          mkdir -p build-device/ipa/Payload
+          ditto "$APP" build-device/ipa/Payload/GoutouJunshi.app
+          cd build-device/ipa
+          ditto -c -k --keepParent Payload ../goutoujunshi-ios-device-unsigned.ipa
+          cd ..
+          shasum -a 256 goutoujunshi-ios-device-unsigned.ipa > SHA256SUMS-IPA.txt
+      - name: Upload unsigned iPhone IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: goutoujunshi-ios-device-unsigned
+          path: |
+            integrations/jev_ios/build-device/goutoujunshi-ios-device-unsigned.ipa
+            integrations/jev_ios/build-device/SHA256SUMS-IPA.txt
+          if-no-files-found: error
+          retention-days: 14
