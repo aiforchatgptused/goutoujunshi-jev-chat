@@ -55,7 +55,7 @@ jobs:
             test "$PLATFORM" = "iPhoneOS"
             EXECUTABLE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$BUNDLE/Info.plist")
             test -x "$BUNDLE/$EXECUTABLE"
-            lipo -verify_arch arm64 "$BUNDLE/$EXECUTABLE"
+            lipo "$BUNDLE/$EXECUTABLE" -verify_arch arm64
           done
           mkdir -p build-device/ipa/Payload
           ditto "$APP" build-device/ipa/Payload/GoutouJunshi.app
