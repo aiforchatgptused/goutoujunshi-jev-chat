@@ -51,8 +51,35 @@ struct CoreChecks {
     static func tokenReply(_ offset: Int) -> [String: Any] {
         let value = token(offset); return completion(value.content, logprobs: value.logprobs)
     }
+    static func signingChecks() throws {
+        let configured = "group.original"
+        try check("Prefer explicitly configured signed group", SignedCapabilities.groupCandidates(configured: configured, signed: ["group.other", configured]) == [configured])
+        try check("Use unambiguous re-signed group", SignedCapabilities.groupCandidates(configured: configured, signed: ["group.remapped"]) == ["group.remapped"])
+        try check("Reject ambiguous groups", SignedCapabilities.groupCandidates(configured: configured, signed: ["group.a", "group.b"]).isEmpty)
+        try check("No profile is treated as signed permission", SignedCapabilities.entitlements(Data()).isEmpty)
+        let xml = try PropertyListSerialization.data(fromPropertyList: ["com.apple.security.application-groups": ["group.remapped"]], format: .xml, options: 0)
+        var bytes = Data(repeating: 0, count: 48)
+        func put(_ value: UInt32, at: Int, big: Bool = false) {
+            for i in 0..<4 { bytes[at + i] = UInt8(truncatingIfNeeded: value >> (big ? (3 - i) * 8 : i * 8)) }
+        }
+        put(0xfeedfacf, at: 0); put(1, at: 16); put(16, at: 20)
+        put(0x1d, at: 32); put(16, at: 36); put(48, at: 40); put(UInt32(28 + xml.count), at: 44)
+        bytes.append(Data(repeating: 0, count: 28))
+        put(0xfade0cc0, at: 48, big: true); put(UInt32(28 + xml.count), at: 52, big: true)
+        put(1, at: 56, big: true); put(5, at: 60, big: true); put(20, at: 64, big: true)
+        put(0xfade7171, at: 68, big: true); put(UInt32(8 + xml.count), at: 72, big: true)
+        bytes.append(xml)
+        try check("Read executable signature XML", SignedCapabilities.entitlements(bytes)["com.apple.security.application-groups"] as? [String] == ["group.remapped"])
+        for end in [4, 31, 47, 55, 70, bytes.count - 1] {
+            try check("Truncated signatures fail closed", SignedCapabilities.entitlements(Data(bytes.prefix(end))).isEmpty)
+        }
+        put(UInt32.max, at: 64, big: true)
+        try check("Invalid blob offsets fail closed", SignedCapabilities.entitlements(bytes).isEmpty)
+    }
+
     static func main() async {
         do {
+            try signingChecks()
             try contracts()
             try await personalizationAndCompatibility()
             try await pipelines()

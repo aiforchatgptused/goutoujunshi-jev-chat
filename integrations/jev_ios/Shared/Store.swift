@@ -3,6 +3,67 @@ import Foundation
 import Security
 #endif
 
+/// Read the executable's signature, never the provisioning profile's permission allowlist.
+/// Unknown/DER-only signatures return no hints; containerURL remains the authority.
+enum SignedCapabilities {
+    static func entitlements(_ data: Data) -> [String: Any] {
+        func word(_ offset: Int, big: Bool = false) -> UInt32? {
+            guard offset >= 0, offset <= data.count - 4 else { return nil }
+            let bytes = Array(data[offset..<offset + 4])
+            return big ? bytes.reduce(0) { ($0 << 8) | UInt32($1) }
+                : bytes.reversed().reduce(0) { ($0 << 8) | UInt32($1) }
+        }
+        guard word(0) == 0xfeedfacf, let commands = word(16), commands < 4096,
+              let commandBytes = word(20), Int(commandBytes) <= data.count - 32 else { return [:] }
+        var cursor = 32
+        let end = 32 + Int(commandBytes)
+        for _ in 0..<commands {
+            guard cursor + 8 <= end, let command = word(cursor), let size = word(cursor + 4),
+                  size >= 8, Int(size) <= end - cursor else { return [:] }
+            defer { cursor += Int(size) }
+            guard command == 0x1d else { continue }
+            guard size >= 16, let offset = word(cursor + 8), let length = word(cursor + 12) else { return [:] }
+            let start = Int(offset), limit = Int(length)
+            guard limit >= 12, start <= data.count, limit <= data.count - start,
+                  word(start, big: true) == 0xfade0cc0,
+                  let total = word(start + 4, big: true), total >= 12, Int(total) <= limit,
+                  let count = word(start + 8, big: true), Int(count) <= (Int(total) - 12) / 8 else { return [:] }
+            for i in 0..<Int(count) {
+                let index = start + 12 + i * 8
+                guard word(index, big: true) == 5, let relative = word(index + 4, big: true) else { continue }
+                let relativeOffset = Int(relative), blob = start + relativeOffset
+                guard relativeOffset >= 12 + Int(count) * 8, relativeOffset <= Int(total) - 8,
+                      word(blob, big: true) == 0xfade7171,
+                      let bytes = word(blob + 4, big: true), bytes >= 8,
+                      Int(bytes) <= Int(total) - relativeOffset else { return [:] }
+                return (try? PropertyListSerialization.propertyList(from: data.subdata(in: blob + 8..<blob + Int(bytes)),
+                    options: [], format: nil)) as? [String: Any] ?? [:]
+            }
+        }
+        return [:]
+    }
+    static let current: [String: Any] = {
+        guard let url = Bundle.main.executableURL, let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return [:] }
+        return entitlements(data)
+    }()
+    static func groupCandidates(configured: String, signed: [String]) -> [String] {
+        let groups = Array(Set(signed.filter { $0.hasPrefix("group.") && !$0.contains("*") && !$0.contains("$(") })).sorted()
+        if groups.contains(configured) { return [configured] }
+        // A single remapped group is unambiguous; never select arbitrarily among multiple groups.
+        return groups.count == 1 ? groups : (groups.isEmpty ? [configured] : [])
+    }
+    #if os(iOS)
+    static let sharedContainer: (group: String, url: URL)? = {
+        let configured = Bundle.main.object(forInfoDictionaryKey: "GoutouAppGroup") as? String ?? "group.ai.goutoujunshi.chatios"
+        for group in groupCandidates(configured: configured, signed: current["com.apple.security.application-groups"] as? [String] ?? []) {
+            if let url = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group) { return (group, url) }
+        }
+        return nil
+    }()
+    static var isExtension: Bool { Bundle.main.bundleURL.pathExtension == "appex" }
+    #endif
+}
+
 struct KeyboardHandoff: Codable {
     var transcript: String
     var advice: Advice
@@ -33,21 +94,34 @@ struct KeyboardSession: Codable {
 }
 
 final class GoutouStore {
-    static var group: String { Bundle.main.object(forInfoDictionaryKey: "GoutouAppGroup") as? String ?? "group.ai.goutoujunshi.chatios" }
+    let isShared: Bool
     private let defaults: UserDefaults
     private let container: URL
 
-    init() throws {
+    init(allowLocalFallback: Bool = false) throws {
         #if os(iOS)
-        guard let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: Self.group),
-              let defaults = UserDefaults(suiteName: Self.group) else {
-            throw GoutouError.invalid("共享配置未连接：当前签名缺少 App Group。主 App 和键盘必须签入同一个获授权应用组；只在签名软件中保留开关不能补授权限。")
+        if let shared = SignedCapabilities.sharedContainer, let defaults = UserDefaults(suiteName: shared.group) {
+            self.container = shared.url
+            self.defaults = defaults
+            isShared = true
+        } else {
+            guard allowLocalFallback && !SignedCapabilities.isExtension else {
+                throw GoutouError.invalid("键盘共享未连接：当前签名没有可用的 App Group。主 App 可单独保存和使用；键盘 AI 仍需主程序与扩展具有一致的共享权限。")
+            }
+            container = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                appropriateFor: nil, create: true).appendingPathComponent("GoutouLocal", isDirectory: true)
+            try FileManager.default.createDirectory(at: container, withIntermediateDirectories: true,
+                attributes: [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication])
+            var excluded = container, values = URLResourceValues()
+            values.isExcludedFromBackup = true
+            try excluded.setResourceValues(values)
+            defaults = .standard
+            isShared = false
         }
-        self.container = container
-        self.defaults = defaults
         #else
         container = FileManager.default.temporaryDirectory.appendingPathComponent("goutou-ios-core-tests")
         defaults = UserDefaults(suiteName: "ai.goutoujunshi.core-tests")!
+        isShared = true
         #endif
         purgeExpiredHandoff()
         captureMailbox.purge(relationship: relationship(), config: config())
@@ -55,7 +129,7 @@ final class GoutouStore {
     }
 
     init(defaults: UserDefaults, container: URL) {
-        self.defaults = defaults; self.container = container
+        self.defaults = defaults; self.container = container; isShared = true
         purgeExpiredHandoff()
         captureMailbox.purge(relationship: relationship(), config: config())
         _ = keyboardSession()
@@ -101,6 +175,7 @@ final class GoutouStore {
         defaults.set(Date().timeIntervalSince1970, forKey: "keyboardLastSeen")
     }
     var keyboardStatus: String {
+        guard isShared else { return "仅主 App 可用 · 键盘共享权限未连接" }
         guard let seen = defaults.object(forKey: "keyboardLastSeen") as? Double, Date().timeIntervalSince1970 - seen < 86_400 else {
             return "尚未检测到键盘；请到聊天输入框切换一次"
         }
@@ -114,6 +189,7 @@ final class GoutouStore {
 
     /// This is an explicit one-time handoff, never an automatic chat archive.
     func handoff(_ value: KeyboardHandoff) throws {
+        guard isShared else { throw GoutouError.invalid("配置仅保存在主 App，当前签名无法向键盘共享内容") }
         let data = try JSONEncoder().encode(value)
         guard data.count <= 512_000 else { throw GoutouError.invalid("本轮内容过大，无法交给键盘") }
         try FileManager.default.createDirectory(at: container, withIntermediateDirectories: true)
@@ -195,15 +271,30 @@ enum CredentialVault {
     // Only missing entitlement/configuration uses the protected shared-container fallback.
     private static func query(_ name: String) throws -> [String: Any]? {
         guard services.contains(name) else { throw GoutouError.invalid("未知密钥服务") }
-        guard let group = Bundle.main.object(forInfoDictionaryKey: "GoutouKeychainGroup") as? String,
-              !group.contains("$("), !group.isEmpty else { return nil }
-        return [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "ai.goutoujunshi.ios." + name,
-                kSecAttrAccount as String: "default", kSecAttrAccessGroup as String: group]
+        var query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "ai.goutoujunshi.ios." + name, kSecAttrAccount as String: "default"]
+        if SignedCapabilities.sharedContainer == nil && !SignedCapabilities.isExtension {
+            // Default private keychain access is resolved by iOS, not by a stale build prefix.
+            return query
+        }
+        let configured = Bundle.main.object(forInfoDictionaryKey: "GoutouKeychainGroup") as? String ?? ""
+        let allowed = SignedCapabilities.current["keychain-access-groups"] as? [String] ?? []
+        let suffix = configured.split(separator: ".").first.map { $0.count == 10 && $0.allSatisfy { $0.isUppercase || $0.isNumber } } == true
+            ? configured.split(separator: ".").dropFirst().joined(separator: ".") : configured
+        let matching = allowed.filter { !$0.contains("*") && !$0.contains("$(") && !suffix.isEmpty && ($0 == configured || $0.hasSuffix("." + suffix)) }
+        guard matching.count == 1 else { return nil }
+        query[kSecAttrAccessGroup as String] = matching[0]
+        return query
     }
     private static func fallbackURL(_ name: String) throws -> URL {
-        guard services.contains(name),
-              let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: GoutouStore.group) else {
-            throw GoutouError.invalid("签名未提供可用 App Group，无法共享密钥。请让主 App 和键盘使用同一个获授权的应用组后重新签名。")
+        guard services.contains(name) else { throw GoutouError.invalid("未知密钥服务") }
+        let container: URL
+        if let shared = SignedCapabilities.sharedContainer { container = shared.url }
+        else if !SignedCapabilities.isExtension {
+            container = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                appropriateFor: nil, create: true).appendingPathComponent("GoutouLocal", isDirectory: true)
+        } else {
+            throw GoutouError.invalid("键盘没有可用共享权限，无法读取主 App 的密钥")
         }
         return container.appendingPathComponent("credentials", isDirectory: true).appendingPathComponent(name + ".key")
     }
@@ -272,6 +363,9 @@ enum CredentialVault {
         }
     }
     static var storageStatus: String {
+        if SignedCapabilities.sharedContainer == nil {
+            return "配置仅保存在主 App；密钥优先使用私有钥匙串，权限缺失时使用受文件保护且排除备份的本机文件。键盘共享尚未连接"
+        }
         let fallback = services.contains { name in
             guard let path = try? fallbackURL(name) else { return false }
             return FileManager.default.fileExists(atPath: path.path)

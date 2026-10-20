@@ -58,12 +58,19 @@ struct ProviderView: View {
                 Stepper("最多 \(draft.count) 条候选", value: $draft.count, in: 1...3)
             }
             Section {
-                Button("保存并应用配置") { save() }.buttonStyle(BrandPrimaryButtonStyle())
+                Button(model.store?.isShared == true ? "保存并应用到键盘" : "保存到主 App") { save() }.buttonStyle(BrandPrimaryButtonStyle())
                     .disabled(testing || model.store == nil).accessibilityIdentifier("saveConfigButton")
                 if testing { HStack { ProgressView(); Button("取消测试") { cancelTest(); message = "已取消" } } }
                 Text(message).font(.footnote).foregroundStyle(Palette.secondary).textSelection(.enabled)
             } footer: {
                 Text(CredentialVault.storageStatus + "。已存 Key 不回显；空白表示保留。兼容模式的文件不是钥匙串，受 iOS 文件保护并排除备份。聊天仅在你确认分析时发送。")
+            }
+            Section("键盘共享诊断") {
+                Text(model.store?.isShared == true ? "主 App 已连接共享容器，请再到键盘验证。" : "主 App 独立保存可用；当前签名未连接键盘共享容器。")
+                if let shared = SignedCapabilities.sharedContainer {
+                    Text("实际共享组：" + shared.group).font(.caption).textSelection(.enabled)
+                }
+                Text("版本 0.2.1 · 构建 14").font(.caption)
             }
             Section("本地数据") {
                 Button("清除键盘暂存与等待取用的内容") {
@@ -126,7 +133,9 @@ struct ProviderView: View {
             }
             try store.saveConfig(draft)
             deepseekKey = ""; openrouterKey = ""; jevKey = ""
-            refreshKeys(); model.reload(); message = "已保存，下一次键盘分析使用新配置。"
+            refreshKeys(); model.reload(); message = store.isShared
+                ? "已保存到共享配置。请切换到键盘验证连接。"
+                : "已保存到主 App，可在主 App 内测试和使用。键盘尚未共享；重新签名修复权限后，请再次填写 Key 并保存到共享配置。"
         } catch { message = error.localizedDescription }
     }
     private func testButton(_ title: String, provider: ReplyProvider) -> some View {

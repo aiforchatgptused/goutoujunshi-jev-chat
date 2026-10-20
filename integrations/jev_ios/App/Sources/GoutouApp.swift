@@ -77,7 +77,7 @@ final class AppModel: ObservableObject {
     private var revision = 0
 
     init() {
-        do { store = try GoutouStore(); reload() }
+        do { store = try GoutouStore(allowLocalFallback: true); reload() }
         catch { status = error.localizedDescription }
     }
     func reload() {

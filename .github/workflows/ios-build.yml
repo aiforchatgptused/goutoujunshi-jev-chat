@@ -44,6 +44,8 @@ jobs:
           name: goutoujunshi-ios-simulator-preview
           path: integrations/jev_ios/build/goutoujunshi-ios-simulator-preview.zip
           if-no-files-found: error
+      - name: Preserve App Group metadata for third-party re-signers
+        run: python3 tools/prepare_resign.py build-device/Build/Products/Debug-iphoneos/GoutouJunshi.app
       - name: Package unsigned iPhone IPA with extensions
         run: |
           set -euo pipefail
