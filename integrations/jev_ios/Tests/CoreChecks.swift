@@ -54,6 +54,7 @@ struct CoreChecks {
     static func main() async {
         do {
             try contracts()
+            try await personalizationAndCompatibility()
             try await pipelines()
             try await visionRequests()
             try persistenceAndTrends()
@@ -65,6 +66,43 @@ struct CoreChecks {
             fputs("FAIL: \(error)\n", stderr)
             exit(1)
         }
+    }
+
+    static func personalizationAndCompatibility() async throws {
+        // Existing installations retain keys/models/preferences when new fields are absent.
+        let old = #"{"judge":"DeepSeek","reply":"DeepSeek","ocr":"Apple Vision · 本地","deepseekModel":"my-model","openrouterModel":"router-model","visionModel":"","jevModel":"jev-latest","tone":"直接","length":"简短","count":2}"#
+        let migrated = try JSONDecoder().decode(AppConfig.self, from: Data(old.utf8))
+        try check("Legacy config retained", migrated.deepseekModel == "my-model" && migrated.count == 2 && migrated.personalStyle == nil)
+        let sample = "对方：DO_NOT_SEND_THIS\n我：行啊\n我：我看看\n我：明天再说吧\n我：到了叫我\n我：好，先这样"
+        let selected = try PersonalStyleLearning.samples(sample)
+        try check("Only explicit own messages sent", !selected.contains("DO_NOT_SEND_THIS") && selected.contains("明天再说吧"))
+        try rejects("No invented style from empty samples") { _ = try PersonalStyleLearning.samples("对方：你好") }
+        var config = AppConfig()
+        config.reply = .openrouter; config.judge = .reply
+        config.openrouterBaseURL = "https://compatible.example/v1/"
+        config.openrouterModel = "custom-chat"
+        config.personalStyle = "STYLE_MARKER 简短，不用表情"
+        config.personalStyleEnabled = true
+        let keys = ProviderSecrets(openrouter: "test-custom-key")
+        let probe = MockTransport([completion("OK")])
+        let api = ModelAPI(transport: probe, config: config, secrets: keys)
+        try api.preflight()
+        try await api.test(.openrouter)
+        try check("Test uses configured URL", probe.calls[0].url.absoluteString == "https://compatible.example/v1/chat/completions")
+        try check("Test does not require JSON mode or logprobs", probe.calls[0].body["response_format"] == nil && probe.calls[0].body["thinking"] == nil && probe.calls[0].body["logprobs"] == nil)
+        let mock = MockTransport([completion(evidence), completion(response), completion(scores)])
+        _ = try await GoutouPipeline(api: ModelAPI(transport: mock, config: config, secrets: keys)).analyze(
+            Transcript(text: "我：这周见面吗\n对方：这周忙", confirmed: true), relationship: Relationship())
+        try check("Custom service handles entire pipeline without DeepSeek key", mock.calls.count == 3 && mock.calls.allSatisfy { $0.url.host == "compatible.example" && $0.key == "test-custom-key" })
+        let generationMessages = mock.calls[1].body["messages"] as! [[String: Any]]
+        try check("Style reaches candidate generation", (generationMessages[0]["content"] as? String)?.contains("STYLE_MARKER") == true)
+        config.personalStyleEnabled = false
+        try check("Style disabled cleanly", config.stylePrompt.isEmpty)
+        let extraction = MockTransport([completion("## 我的表达\n短句，少用表情")])
+        let extracted = try await PersonalStyleLearning.distill(sample, api: ModelAPI(transport: extraction, config: config, secrets: keys))
+        try check("Style extraction uses configured reply API", extracted.contains("短句") && extraction.calls.count == 1)
+        let messages = extraction.calls[0].body["messages"] as! [[String: Any]]
+        try check("Other speaker never sent to extraction", !(messages[1]["content"] as! String).contains("DO_NOT_SEND_THIS"))
     }
 
     static func contracts() throws {
