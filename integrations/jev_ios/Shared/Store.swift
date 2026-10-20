@@ -3,6 +3,67 @@ import Foundation
 import Security
 #endif
 
+/// Read the executable's signature, never the provisioning profile's permission allowlist.
+/// Unknown/DER-only signatures return no hints; containerURL remains the authority.
+enum SignedCapabilities {
+    static func entitlements(_ data: Data) -> [String: Any] {
+        func word(_ offset: Int, big: Bool = false) -> UInt32? {
+            guard offset >= 0, offset <= data.count - 4 else { return nil }
+            let bytes = Array(data[offset..<offset + 4])
+            return big ? bytes.reduce(0) { ($0 << 8) | UInt32($1) }
+                : bytes.reversed().reduce(0) { ($0 << 8) | UInt32($1) }
+        }
+        guard word(0) == 0xfeedfacf, let commands = word(16), commands < 4096,
+              let commandBytes = word(20), Int(commandBytes) <= data.count - 32 else { return [:] }
+        var cursor = 32
+        let end = 32 + Int(commandBytes)
+        for _ in 0..<commands {
+            guard cursor + 8 <= end, let command = word(cursor), let size = word(cursor + 4),
+                  size >= 8, Int(size) <= end - cursor else { return [:] }
+            defer { cursor += Int(size) }
+            guard command == 0x1d else { continue }
+            guard size >= 16, let offset = word(cursor + 8), let length = word(cursor + 12) else { return [:] }
+            let start = Int(offset), limit = Int(length)
+            guard limit >= 12, start <= data.count, limit <= data.count - start,
+                  word(start, big: true) == 0xfade0cc0,
+                  let total = word(start + 4, big: true), total >= 12, Int(total) <= limit,
+                  let count = word(start + 8, big: true), Int(count) <= (Int(total) - 12) / 8 else { return [:] }
+            for i in 0..<Int(count) {
+                let index = start + 12 + i * 8
+                guard word(index, big: true) == 5, let relative = word(index + 4, big: true) else { continue }
+                let relativeOffset = Int(relative), blob = start + relativeOffset
+                guard relativeOffset >= 12 + Int(count) * 8, relativeOffset <= Int(total) - 8,
+                      word(blob, big: true) == 0xfade7171,
+                      let bytes = word(blob + 4, big: true), bytes >= 8,
+                      Int(bytes) <= Int(total) - relativeOffset else { return [:] }
+                return (try? PropertyListSerialization.propertyList(from: data.subdata(in: blob + 8..<blob + Int(bytes)),
+                    options: [], format: nil)) as? [String: Any] ?? [:]
+            }
+        }
+        return [:]
+    }
+    static let current: [String: Any] = {
+        guard let url = Bundle.main.executableURL, let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return [:] }
+        return entitlements(data)
+    }()
+    static func groupCandidates(configured: String, signed: [String]) -> [String] {
+        let groups = Array(Set(signed.filter { $0.hasPrefix("group.") && !$0.contains("*") && !$0.contains("$(") })).sorted()
+        if groups.contains(configured) { return [configured] }
+        // A single remapped group is unambiguous; never select arbitrarily among multiple groups.
+        return groups.count == 1 ? groups : (groups.isEmpty ? [configured] : [])
+    }
+    #if os(iOS)
+    static let sharedContainer: (group: String, url: URL)? = {
+        let configured = Bundle.main.object(forInfoDictionaryKey: "GoutouAppGroup") as? String ?? "group.ai.goutoujunshi.chatios"
+        for group in groupCandidates(configured: configured, signed: current["com.apple.security.application-groups"] as? [String] ?? []) {
+            if let url = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group) { return (group, url) }
+        }
+        return nil
+    }()
+    static var isExtension: Bool { Bundle.main.bundleURL.pathExtension == "appex" }
+    #endif
+}
+
 struct KeyboardHandoff: Codable {
     var transcript: String
     var advice: Advice
@@ -33,21 +94,34 @@ struct KeyboardSession: Codable {
 }
 
 final class GoutouStore {
-    static var group: String { Bundle.main.object(forInfoDictionaryKey: "GoutouAppGroup") as? String ?? "group.ai.goutoujunshi.chatios" }
+    let isShared: Bool
     private let defaults: UserDefaults
     private let container: URL
 
-    init() throws {
+    init(allowLocalFallback: Bool = false) throws {
         #if os(iOS)
-        guard let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: Self.group),
-              let defaults = UserDefaults(suiteName: Self.group) else {
-            throw GoutouError.invalid("共享配置未连接：请在 Xcode 为 App 与键盘配置相同 App Group 和开发者 Team")
+        if let shared = SignedCapabilities.sharedContainer, let defaults = UserDefaults(suiteName: shared.group) {
+            self.container = shared.url
+            self.defaults = defaults
+            isShared = true
+        } else {
+            guard allowLocalFallback && !SignedCapabilities.isExtension else {
+                throw GoutouError.invalid("键盘共享未连接：当前签名没有可用的 App Group。主 App 可单独保存和使用；键盘 AI 仍需主程序与扩展具有一致的共享权限。")
+            }
+            container = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                appropriateFor: nil, create: true).appendingPathComponent("GoutouLocal", isDirectory: true)
+            try FileManager.default.createDirectory(at: container, withIntermediateDirectories: true,
+                attributes: [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication])
+            var excluded = container, values = URLResourceValues()
+            values.isExcludedFromBackup = true
+            try excluded.setResourceValues(values)
+            defaults = .standard
+            isShared = false
         }
-        self.container = container
-        self.defaults = defaults
         #else
         container = FileManager.default.temporaryDirectory.appendingPathComponent("goutou-ios-core-tests")
         defaults = UserDefaults(suiteName: "ai.goutoujunshi.core-tests")!
+        isShared = true
         #endif
         purgeExpiredHandoff()
         captureMailbox.purge(relationship: relationship(), config: config())
@@ -55,7 +129,7 @@ final class GoutouStore {
     }
 
     init(defaults: UserDefaults, container: URL) {
-        self.defaults = defaults; self.container = container
+        self.defaults = defaults; self.container = container; isShared = true
         purgeExpiredHandoff()
         captureMailbox.purge(relationship: relationship(), config: config())
         _ = keyboardSession()
@@ -101,6 +175,7 @@ final class GoutouStore {
         defaults.set(Date().timeIntervalSince1970, forKey: "keyboardLastSeen")
     }
     var keyboardStatus: String {
+        guard isShared else { return "仅主 App 可用 · 键盘共享权限未连接" }
         guard let seen = defaults.object(forKey: "keyboardLastSeen") as? Double, Date().timeIntervalSince1970 - seen < 86_400 else {
             return "尚未检测到键盘；请到聊天输入框切换一次"
         }
@@ -114,6 +189,7 @@ final class GoutouStore {
 
     /// This is an explicit one-time handoff, never an automatic chat archive.
     func handoff(_ value: KeyboardHandoff) throws {
+        guard isShared else { throw GoutouError.invalid("配置仅保存在主 App，当前签名无法向键盘共享内容") }
         let data = try JSONEncoder().encode(value)
         guard data.count <= 512_000 else { throw GoutouError.invalid("本轮内容过大，无法交给键盘") }
         try FileManager.default.createDirectory(at: container, withIntermediateDirectories: true)
@@ -191,41 +267,113 @@ final class GoutouStore {
 enum CredentialVault {
     static let services = ["deepseek", "openrouter", "jev"]
     #if os(iOS)
-    private static func query(_ name: String) throws -> [String: Any] {
-        guard services.contains(name), let group = Bundle.main.object(forInfoDictionaryKey: "GoutouKeychainGroup") as? String,
-              !group.contains("$("), !group.isEmpty else { throw GoutouError.invalid("共享钥匙串配置未完成，请检查两个 target 的 Keychain Sharing") }
-        return [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "ai.goutoujunshi.ios." + name,
-                kSecAttrAccount as String: "default", kSecAttrAccessGroup as String: group]
+    // Re-signers may replace entitlements without updating Info.plist's original prefix.
+    // Only missing entitlement/configuration uses the protected shared-container fallback.
+    private static func query(_ name: String) throws -> [String: Any]? {
+        guard services.contains(name) else { throw GoutouError.invalid("未知密钥服务") }
+        var query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "ai.goutoujunshi.ios." + name, kSecAttrAccount as String: "default"]
+        if SignedCapabilities.sharedContainer == nil && !SignedCapabilities.isExtension {
+            // Default private keychain access is resolved by iOS, not by a stale build prefix.
+            return query
+        }
+        let configured = Bundle.main.object(forInfoDictionaryKey: "GoutouKeychainGroup") as? String ?? ""
+        let allowed = SignedCapabilities.current["keychain-access-groups"] as? [String] ?? []
+        let suffix = configured.split(separator: ".").first.map { $0.count == 10 && $0.allSatisfy { $0.isUppercase || $0.isNumber } } == true
+            ? configured.split(separator: ".").dropFirst().joined(separator: ".") : configured
+        let matching = allowed.filter { !$0.contains("*") && !$0.contains("$(") && !suffix.isEmpty && ($0 == configured || $0.hasSuffix("." + suffix)) }
+        guard matching.count == 1 else { return nil }
+        query[kSecAttrAccessGroup as String] = matching[0]
+        return query
+    }
+    private static func fallbackURL(_ name: String) throws -> URL {
+        guard services.contains(name) else { throw GoutouError.invalid("未知密钥服务") }
+        let container: URL
+        if let shared = SignedCapabilities.sharedContainer { container = shared.url }
+        else if !SignedCapabilities.isExtension {
+            container = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                appropriateFor: nil, create: true).appendingPathComponent("GoutouLocal", isDirectory: true)
+        } else {
+            throw GoutouError.invalid("键盘没有可用共享权限，无法读取主 App 的密钥")
+        }
+        return container.appendingPathComponent("credentials", isDirectory: true).appendingPathComponent(name + ".key")
+    }
+    private static func fallbackRead(_ name: String) throws -> String {
+        let path = try fallbackURL(name)
+        guard FileManager.default.fileExists(atPath: path.path) else { return "" }
+        let data = try Data(contentsOf: path)
+        guard data.count <= 4096, let value = String(data: data, encoding: .utf8) else {
+            throw GoutouError.invalid("本机密钥数据损坏，请重新保存此服务的 Key")
+        }
+        return value
+    }
+    private static func fallbackWrite(_ value: String, name: String) throws {
+        let path = try fallbackURL(name), directory = path.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+            attributes: [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication])
+        var excluded = directory, attributes = URLResourceValues()
+        attributes.isExcludedFromBackup = true
+        try excluded.setResourceValues(attributes)
+        try Data(value.utf8).write(to: path, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
     }
     static func read(_ name: String) throws -> String {
-        var query = try query(name)
+        // A fallback file is authoritative, including the empty deletion marker.
+        if let path = try? fallbackURL(name), FileManager.default.fileExists(atPath: path.path) {
+            return try fallbackRead(name)
+        }
+        guard var query = try query(name) else { return try fallbackRead(name) }
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
+        if status == errSecMissingEntitlement { return try fallbackRead(name) }
         if status == errSecItemNotFound { return "" }
         guard status == errSecSuccess, let data = item as? Data, let value = String(data: data, encoding: .utf8) else {
-            throw GoutouError.invalid("钥匙串读取失败（\(status)），请检查共享权限")
+            throw GoutouError.invalid("钥匙串读取失败（\(status)），请解锁手机后重试")
         }
         return value
     }
     static func write(_ value: String, name: String) throws {
         let value = value.trimmed
         guard !value.isEmpty, value.count <= 1024 else { throw GoutouError.invalid("请输入有效的 API Key") }
-        let query = try query(name)
+        guard let query = try query(name) else { try fallbackWrite(value, name: name); return }
         let attributes: [String: Any] = [kSecValueData as String: Data(value.utf8),
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly]
         var status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
         if status == errSecItemNotFound {
             status = SecItemAdd(query.merging(attributes, uniquingKeysWith: { _, new in new }) as CFDictionary, nil)
         }
-        guard status == errSecSuccess else { throw GoutouError.invalid("密钥保存失败（\(status)），请检查共享钥匙串签名") }
+        if status == errSecMissingEntitlement { try fallbackWrite(value, name: name); return }
+        guard status == errSecSuccess else { throw GoutouError.invalid("密钥保存失败（\(status)）") }
+        if let path = try? fallbackURL(name), FileManager.default.fileExists(atPath: path.path) {
+            try FileManager.default.removeItem(at: path)
+        }
     }
     static func delete(_ name: String) throws {
-        let status = SecItemDelete(try query(name) as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else { throw GoutouError.invalid("无法删除密钥（\(status)）") }
+        if let query = try query(name) {
+            let status = SecItemDelete(query as CFDictionary)
+            guard [errSecSuccess, errSecItemNotFound, errSecMissingEntitlement].contains(status) else {
+                throw GoutouError.invalid("无法删除密钥（\(status)）")
+            }
+            // Prevent an inaccessible old key resurfacing if signing changes again.
+            if status == errSecMissingEntitlement { try fallbackWrite("", name: name); return }
+        }
+        if let path = try? fallbackURL(name), FileManager.default.fileExists(atPath: path.path) {
+            try FileManager.default.removeItem(at: path)
+        }
+    }
+    static var storageStatus: String {
+        if SignedCapabilities.sharedContainer == nil {
+            return "配置仅保存在主 App；密钥优先使用私有钥匙串，权限缺失时使用受文件保护且排除备份的本机文件。键盘共享尚未连接"
+        }
+        let fallback = services.contains { name in
+            guard let path = try? fallbackURL(name) else { return false }
+            return FileManager.default.fileExists(atPath: path.path)
+        }
+        return fallback ? "密钥存储：签名兼容模式（本机文件保护，排除备份的共享应用组文件）" : "密钥存储：优先共享钥匙串；共享权限缺失时使用受系统文件保护的应用组文件"
     }
     #else
+    static var storageStatus: String { "仅在 iOS 上保存密钥" }
     static func read(_ name: String) throws -> String { "" }
     static func write(_ value: String, name: String) throws { throw GoutouError.invalid("请在 iOS App 中配置密钥") }
     static func delete(_ name: String) throws {}

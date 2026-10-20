@@ -21,14 +21,14 @@ struct ProviderView: View {
                 Text("只用 DeepSeek 时只需配置 DeepSeek Key。策略先整理证据，再检查首 token 权重；缺失或不稳定时标注不可用。")
                     .font(.caption).foregroundStyle(Palette.secondary)
             }
-            Section("DeepSeek 官方") {
-                Text("https://api.deepseek.com").font(.caption).foregroundStyle(Palette.secondary)
+            Section("DeepSeek / 兼容服务") {
+                modelField("Base URL", value: Binding(get: { draft.deepseekEndpoint }, set: { draft.deepseekBaseURL = $0 }))
                 modelField("模型 ID", value: $draft.deepseekModel)
                 keyField("deepseek", value: $deepseekKey)
                 testButton("测试 DeepSeek", provider: .deepseek)
             }
-            Section("OpenRouter") {
-                Text("https://openrouter.ai/api/v1").font(.caption).foregroundStyle(Palette.secondary)
+            Section("OpenRouter / 自定义兼容接口") {
+                modelField("Base URL（保留服务商要求的 /v1）", value: Binding(get: { draft.openrouterEndpoint }, set: { draft.openrouterBaseURL = $0 }))
                 modelField("回复模型 ID", value: $draft.openrouterModel)
                 modelField("识图模型 ID（独立配置）", value: $draft.visionModel)
                 keyField("openrouter", value: $openrouterKey)
@@ -41,6 +41,12 @@ struct ProviderView: View {
                 keyField("jev", value: $jevKey)
                 Button("测试 Jev 判断") { testJev() }.disabled(testing)
             }
+            Section("接口兼容性") {
+                Toggle("请求 JSON 模式（服务商支持时开启）", isOn: Binding(get: { draft.requestJSONMode == true }, set: { draft.requestJSONMode = $0 }))
+                Button("判断和回复使用自定义接口") { draft.reply = .openrouter; draft.judge = .reply }
+                Text("兼容 OpenAI Chat Completions 协议。可填 Base URL 或完整 /chat/completions 地址；不会擅自添加 /v1。测试只检查文字回复，不要求 JSON 模式或策略 token 权重。")
+                    .font(.caption).foregroundStyle(Palette.secondary)
+            }
             Section("截图识别") {
                 Picker("识别方式", selection: $draft.ocr) { ForEach(OCRProvider.allCases, id: \.self) { Text($0.rawValue).tag($0) } }
                 Text("Apple Vision 在手机本地识别。云端识图会发送你选的截图，使用对应服务的 Key 并产生用量；键盘自身不截屏，日常拼音和英文输入在本机完成。")
@@ -52,12 +58,19 @@ struct ProviderView: View {
                 Stepper("最多 \(draft.count) 条候选", value: $draft.count, in: 1...3)
             }
             Section {
-                Button("保存并应用配置") { save() }.buttonStyle(BrandPrimaryButtonStyle())
+                Button(model.store?.isShared == true ? "保存并应用到键盘" : "保存到主 App") { save() }.buttonStyle(BrandPrimaryButtonStyle())
                     .disabled(testing || model.store == nil).accessibilityIdentifier("saveConfigButton")
                 if testing { HStack { ProgressView(); Button("取消测试") { cancelTest(); message = "已取消" } } }
                 Text(message).font(.footnote).foregroundStyle(Palette.secondary).textSelection(.enabled)
             } footer: {
-                Text("密钥保存在 App 与键盘共享的本机钥匙串，已存 Key 不回显；空白表示保留原 Key。聊天仅在你确认分析时发送到所选接口。")
+                Text(CredentialVault.storageStatus + "。已存 Key 不回显；空白表示保留。兼容模式的文件不是钥匙串，受 iOS 文件保护并排除备份。聊天仅在你确认分析时发送。")
+            }
+            Section("键盘共享诊断") {
+                Text(model.store?.isShared == true ? "主 App 已连接共享容器，请再到键盘验证。" : "主 App 独立保存可用；当前签名未连接键盘共享容器。")
+                if let shared = SignedCapabilities.sharedContainer {
+                    Text("实际共享组：" + shared.group).font(.caption).textSelection(.enabled)
+                }
+                Text("版本 0.2.1 · 构建 14").font(.caption)
             }
             Section("本地数据") {
                 Button("清除键盘暂存与等待取用的内容") {
@@ -97,29 +110,38 @@ struct ProviderView: View {
             for name in CredentialVault.services where !(try CredentialVault.read(name)).isEmpty { savedKeys.insert(name) }
         } catch { message = error.localizedDescription }
     }
-    private func secrets() throws -> ProviderSecrets {
-        var result = try CredentialVault.load()
-        if !deepseekKey.trimmed.isEmpty { result.deepseek = deepseekKey.trimmed }
-        if !openrouterKey.trimmed.isEmpty { result.openrouter = openrouterKey.trimmed }
-        if !jevKey.trimmed.isEmpty { result.jev = jevKey.trimmed }
+    private func secrets(for provider: ReplyProvider? = nil, jevOnly: Bool = false) throws -> ProviderSecrets {
+        // Resolve only the tested service and prefer the unsaved field. A broken
+        // shared-keychain entry must never block a valid freshly entered test key.
+        var result = ProviderSecrets()
+        func key(_ typed: String, _ name: String) throws -> String {
+            typed.trimmed.isEmpty ? try CredentialVault.read(name) : typed.trimmed
+        }
+        if jevOnly { result.jev = try key(jevKey, "jev") }
+        else if provider == .deepseek { result.deepseek = try key(deepseekKey, "deepseek") }
+        else if provider == .openrouter { result.openrouter = try key(openrouterKey, "openrouter") }
         return result
     }
     private func save() {
         do {
             try draft.validate()
+            _ = try ModelAPI.chatURL(draft.deepseekEndpoint)
+            _ = try ModelAPI.chatURL(draft.openrouterEndpoint)
             guard let store = model.store else { throw GoutouError.invalid("App Group 未连接") }
             for (name, value) in [("deepseek", deepseekKey), ("openrouter", openrouterKey), ("jev", jevKey)] where !value.trimmed.isEmpty {
                 try CredentialVault.write(value, name: name)
             }
             try store.saveConfig(draft)
             deepseekKey = ""; openrouterKey = ""; jevKey = ""
-            refreshKeys(); model.reload(); message = "已保存，下一次键盘分析使用新配置。"
+            refreshKeys(); model.reload(); message = store.isShared
+                ? "已保存到共享配置。请切换到键盘验证连接。"
+                : "已保存到主 App，可在主 App 内测试和使用。键盘尚未共享；重新签名修复权限后，请再次填写 Key 并保存到共享配置。"
         } catch { message = error.localizedDescription }
     }
     private func testButton(_ title: String, provider: ReplyProvider) -> some View {
         Button(title) {
             do {
-                let api = ModelAPI(transport: model.transport, config: draft, secrets: try secrets())
+                let api = ModelAPI(transport: model.transport, config: draft, secrets: try secrets(for: provider))
                 cancelTest()
                 let generation = testRevision
                 testing = true; message = "连接测试中，会产生少量接口用量…"
@@ -127,7 +149,7 @@ struct ProviderView: View {
                     do {
                         try await api.test(provider); try Task.checkCancellation()
                         guard testRevision == generation else { return }
-                        message = "连接成功；真实分析与识图还需分别验证。"
+                        message = "文字生成测试成功。请点“保存并应用配置”；策略分析、识图和键盘需分别验证。"
                     } catch {
                         guard testRevision == generation else { return }
                         message = error is CancellationError ? "已取消" : error.localizedDescription
@@ -139,7 +161,7 @@ struct ProviderView: View {
     }
     private func testJev() {
         do {
-            let api = ModelAPI(transport: model.transport, config: draft, secrets: try secrets())
+            let api = ModelAPI(transport: model.transport, config: draft, secrets: try secrets(jevOnly: true))
             cancelTest()
             let generation = testRevision
             testing = true; message = "测试 Jev 判断中，会产生接口用量…"

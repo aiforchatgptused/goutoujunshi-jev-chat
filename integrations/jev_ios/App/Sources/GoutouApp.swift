@@ -17,6 +17,8 @@ struct GoutouApp: App {
                     .tabItem { Label("关系", systemImage: "person.crop.circle") }.tag(1)
                 NavigationStack { ProviderView().navigationTitle("接口与偏好") }
                     .tabItem { Label("配置", systemImage: "slider.horizontal.3") }.tag(2)
+                NavigationStack { PersonalStyleView().navigationTitle("我的说话风格") }
+                    .tabItem { Label("风格", systemImage: "person.text.rectangle") }.tag(4)
                 NavigationStack { TrendView().navigationTitle("关系趋势 K 线") }
                     .tabItem { Label("K 线", systemImage: "chart.xyaxis.line") }.tag(3)
             }
@@ -75,7 +77,7 @@ final class AppModel: ObservableObject {
     private var revision = 0
 
     init() {
-        do { store = try GoutouStore(); reload() }
+        do { store = try GoutouStore(allowLocalFallback: true); reload() }
         catch { status = error.localizedDescription }
     }
     func reload() {

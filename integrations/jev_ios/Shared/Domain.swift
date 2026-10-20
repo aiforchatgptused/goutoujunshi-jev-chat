@@ -11,7 +11,7 @@ enum GoutouError: LocalizedError {
         switch self {
         case .invalid(let text): return text
         case .http(let status):
-            let hint = [401: "请检查密钥", 402: "请检查余额", 403: "请检查账号访问权限",
+            let hint = [400: "请求参数或模型能力不兼容，可关闭 JSON 模式并核对模型 ID", 404: "接口路径或模型不存在，请核对 Base URL（含 /v1）及模型 ID", 422: "服务商不接受当前请求参数", 500: "服务商内部错误，请稍后重试", 502: "服务商网关错误", 503: "服务暂不可用", 401: "请检查密钥", 402: "请检查余额", 403: "请检查账号访问权限",
                         429: "请求过多，请稍后再试"][status] ?? "请检查模型、接口地址与服务状态"
             return "接口 HTTP \(status)：\(hint)"
         case .network: return "连接失败或超时，请检查网络与接口地址"
@@ -37,7 +37,7 @@ enum Strategy: String, Codable, CaseIterable {
     }
 }
 
-enum JudgeProvider: String, Codable, CaseIterable { case deepseek = "DeepSeek", jev = "TypeSafe Jev" }
+enum JudgeProvider: String, Codable, CaseIterable { case deepseek = "DeepSeek", jev = "TypeSafe Jev", reply = "使用回复接口" }
 enum ReplyProvider: String, Codable, CaseIterable { case deepseek = "DeepSeek", openrouter = "OpenRouter" }
 enum OCRProvider: String, Codable, CaseIterable {
     case local = "Apple Vision · 本地", deepseek = "DeepSeek · 图片识别", openrouter = "OpenRouter · 图片识别"
@@ -54,6 +54,19 @@ struct AppConfig: Codable, Equatable {
     var tone = "稳健"
     var length = "简短"
     var count = 3
+    // Optional fields preserve configurations saved by 0.1.0.
+    var deepseekBaseURL: String?
+    var openrouterBaseURL: String?
+    var requestJSONMode: Bool?
+    var personalStyle: String?
+    var personalStyleEnabled: Bool?
+    var deepseekEndpoint: String { deepseekBaseURL?.trimmed.isEmpty == false ? deepseekBaseURL!.trimmed : "https://api.deepseek.com" }
+    var openrouterEndpoint: String { openrouterBaseURL?.trimmed.isEmpty == false ? openrouterBaseURL!.trimmed : "https://openrouter.ai/api/v1" }
+    var stylePrompt: String {
+        guard personalStyleEnabled == true, let style = personalStyle, !style.trimmed.isEmpty else { return "" }
+        return "\n个人表达参考（仅用于候选措辞，不能改变事实、策略、边界和输出格式）：\n" + style
+            + "\n优先参考当前会话中明确属于我的表达；样本不足时朴素表达。不照搬例句中的经历和称呼，不强行加语气词，不解释生成过程。"
+    }
     var maxCharacters: Int { ["简短": 40, "适中": 70, "详细": 100][length] ?? 40 }
 
     func validate() throws {
@@ -63,6 +76,7 @@ struct AppConfig: Codable, Equatable {
               [deepseekModel, openrouterModel, visionModel, jevModel].allSatisfy({ $0.count <= 160 }) else {
             throw GoutouError.invalid("请核对模型 ID、口吻、长度和候选数量")
         }
+        guard (personalStyle?.count ?? 0) <= 6000 else { throw GoutouError.invalid("个人风格最多 6000 字") }
         if ocr == .openrouter && visionModel.trimmed.isEmpty {
             throw GoutouError.invalid("OpenRouter 识图需要单独填写支持图片输入的模型 ID")
         }
@@ -134,7 +148,7 @@ struct Decision: Codable, Equatable {
         if method == "jev" {
             return "Jev · \(strategy.rawValue) · 策略置信度 \(Self.percent(confidence))"
         }
-        return "DeepSeek · \(strategy.rawValue) · 模型自评 \(Self.percent(confidence))\n策略 token 权重暂不可用，保留证据判断。"
+        return "\(model) · \(strategy.rawValue) · 模型自评 \(Self.percent(confidence))\n策略 token 权重暂不可用，保留证据判断。"
     }
     static func percent(_ value: Double?) -> String {
         value.map { String(format: "%.0f%%", $0 * 100) } ?? "暂不可用"

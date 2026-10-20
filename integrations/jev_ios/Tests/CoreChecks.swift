@@ -51,9 +51,37 @@ struct CoreChecks {
     static func tokenReply(_ offset: Int) -> [String: Any] {
         let value = token(offset); return completion(value.content, logprobs: value.logprobs)
     }
+    static func signingChecks() throws {
+        let configured = "group.original"
+        try check("Prefer explicitly configured signed group", SignedCapabilities.groupCandidates(configured: configured, signed: ["group.other", configured]) == [configured])
+        try check("Use unambiguous re-signed group", SignedCapabilities.groupCandidates(configured: configured, signed: ["group.remapped"]) == ["group.remapped"])
+        try check("Reject ambiguous groups", SignedCapabilities.groupCandidates(configured: configured, signed: ["group.a", "group.b"]).isEmpty)
+        try check("No profile is treated as signed permission", SignedCapabilities.entitlements(Data()).isEmpty)
+        let xml = try PropertyListSerialization.data(fromPropertyList: ["com.apple.security.application-groups": ["group.remapped"]], format: .xml, options: 0)
+        var bytes = Data(repeating: 0, count: 48)
+        func put(_ value: UInt32, at: Int, big: Bool = false) {
+            for i in 0..<4 { bytes[at + i] = UInt8(truncatingIfNeeded: value >> (big ? (3 - i) * 8 : i * 8)) }
+        }
+        put(0xfeedfacf, at: 0); put(1, at: 16); put(16, at: 20)
+        put(0x1d, at: 32); put(16, at: 36); put(48, at: 40); put(UInt32(28 + xml.count), at: 44)
+        bytes.append(Data(repeating: 0, count: 28))
+        put(0xfade0cc0, at: 48, big: true); put(UInt32(28 + xml.count), at: 52, big: true)
+        put(1, at: 56, big: true); put(5, at: 60, big: true); put(20, at: 64, big: true)
+        put(0xfade7171, at: 68, big: true); put(UInt32(8 + xml.count), at: 72, big: true)
+        bytes.append(xml)
+        try check("Read executable signature XML", SignedCapabilities.entitlements(bytes)["com.apple.security.application-groups"] as? [String] == ["group.remapped"])
+        for end in [4, 31, 47, 55, 70, bytes.count - 1] {
+            try check("Truncated signatures fail closed", SignedCapabilities.entitlements(Data(bytes.prefix(end))).isEmpty)
+        }
+        put(UInt32.max, at: 64, big: true)
+        try check("Invalid blob offsets fail closed", SignedCapabilities.entitlements(bytes).isEmpty)
+    }
+
     static func main() async {
         do {
+            try signingChecks()
             try contracts()
+            try await personalizationAndCompatibility()
             try await pipelines()
             try await visionRequests()
             try persistenceAndTrends()
@@ -65,6 +93,43 @@ struct CoreChecks {
             fputs("FAIL: \(error)\n", stderr)
             exit(1)
         }
+    }
+
+    static func personalizationAndCompatibility() async throws {
+        // Existing installations retain keys/models/preferences when new fields are absent.
+        let old = #"{"judge":"DeepSeek","reply":"DeepSeek","ocr":"Apple Vision · 本地","deepseekModel":"my-model","openrouterModel":"router-model","visionModel":"","jevModel":"jev-latest","tone":"直接","length":"简短","count":2}"#
+        let migrated = try JSONDecoder().decode(AppConfig.self, from: Data(old.utf8))
+        try check("Legacy config retained", migrated.deepseekModel == "my-model" && migrated.count == 2 && migrated.personalStyle == nil)
+        let sample = "对方：DO_NOT_SEND_THIS\n我：行啊\n我：我看看\n我：明天再说吧\n我：到了叫我\n我：好，先这样"
+        let selected = try PersonalStyleLearning.samples(sample)
+        try check("Only explicit own messages sent", !selected.contains("DO_NOT_SEND_THIS") && selected.contains("明天再说吧"))
+        try rejects("No invented style from empty samples") { _ = try PersonalStyleLearning.samples("对方：你好") }
+        var config = AppConfig()
+        config.reply = .openrouter; config.judge = .reply
+        config.openrouterBaseURL = "https://compatible.example/v1/"
+        config.openrouterModel = "custom-chat"
+        config.personalStyle = "STYLE_MARKER 简短，不用表情"
+        config.personalStyleEnabled = true
+        let keys = ProviderSecrets(openrouter: "test-custom-key")
+        let probe = MockTransport([completion("OK")])
+        let api = ModelAPI(transport: probe, config: config, secrets: keys)
+        try api.preflight()
+        try await api.test(.openrouter)
+        try check("Test uses configured URL", probe.calls[0].url.absoluteString == "https://compatible.example/v1/chat/completions")
+        try check("Test does not require JSON mode or logprobs", probe.calls[0].body["response_format"] == nil && probe.calls[0].body["thinking"] == nil && probe.calls[0].body["logprobs"] == nil)
+        let mock = MockTransport([completion(evidence), completion(response), completion(scores)])
+        _ = try await GoutouPipeline(api: ModelAPI(transport: mock, config: config, secrets: keys)).analyze(
+            Transcript(text: "我：这周见面吗\n对方：这周忙", confirmed: true), relationship: Relationship())
+        try check("Custom service handles entire pipeline without DeepSeek key", mock.calls.count == 3 && mock.calls.allSatisfy { $0.url.host == "compatible.example" && $0.key == "test-custom-key" })
+        let generationMessages = mock.calls[1].body["messages"] as! [[String: Any]]
+        try check("Style reaches candidate generation", (generationMessages[0]["content"] as? String)?.contains("STYLE_MARKER") == true)
+        config.personalStyleEnabled = false
+        try check("Style disabled cleanly", config.stylePrompt.isEmpty)
+        let extraction = MockTransport([completion("## 我的表达\n短句，少用表情")])
+        let extracted = try await PersonalStyleLearning.distill(sample, api: ModelAPI(transport: extraction, config: config, secrets: keys))
+        try check("Style extraction uses configured reply API", extracted.contains("短句") && extraction.calls.count == 1)
+        let messages = extraction.calls[0].body["messages"] as! [[String: Any]]
+        try check("Other speaker never sent to extraction", !(messages[1]["content"] as! String).contains("DO_NOT_SEND_THIS"))
     }
 
     static func contracts() throws {
