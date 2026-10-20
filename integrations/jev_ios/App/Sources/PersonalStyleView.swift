@@ -31,7 +31,7 @@ struct PersonalStyleView: View {
                     .accessibilityIdentifier("personalStyleEditor")
                 Text("先查看提炼结果，可直接修改。保存后用于候选生成、改写和排序；不改变军师的事实判断与策略。已有风格会在新结果保存前保留。")
                     .font(.caption).foregroundStyle(Palette.secondary)
-                Button("保存并应用到键盘") { save() }.disabled(busy || model.store == nil)
+                Button(model.store?.isShared == true ? "保存并应用到键盘" : "保存到主 App") { save() }.disabled(busy || model.store == nil)
                     .buttonStyle(BrandPrimaryButtonStyle())
                 Button("清除已保存的风格", role: .destructive) {
                     style = ""; enabled = false; save()
@@ -81,7 +81,7 @@ struct PersonalStyleView: View {
                     try Task.checkCancellation()
                     guard generation == revision else { return }
                     style = output; enabled = true
-                    message = "提炼完成，请检查后点“保存并应用到键盘”"
+                    message = "提炼完成，请检查后保存"
                 } catch {
                     guard generation == revision else { return }
                     message = error is CancellationError ? "已取消" : error.localizedDescription
@@ -97,7 +97,9 @@ struct PersonalStyleView: View {
             var config = store.config()
             config.personalStyle = style.trimmed; config.personalStyleEnabled = enabled
             try store.saveConfig(config); model.reload()
-            message = enabled ? "已保存；键盘下次分析将使用你的风格" : "已保存；个人风格已关闭"
+            message = enabled
+                ? (store.isShared ? "已保存；键盘连接共享配置后将使用你的风格" : "已保存到主 App；键盘共享尚未连接")
+                : "已保存；个人风格已关闭"
         } catch { message = error.localizedDescription }
     }
 }
