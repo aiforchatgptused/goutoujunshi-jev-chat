@@ -1,0 +1,70 @@
+name: Suiyan
+options:
+  bundleIdPrefix: app.suiyan.independent
+  deploymentTarget:
+    iOS: '16.0'
+settings:
+  base:
+    SWIFT_VERSION: '5.0'
+    CURRENT_PROJECT_VERSION: '1'
+    MARKETING_VERSION: '0.1.0'
+    TARGETED_DEVICE_FAMILY: '1'
+    CODE_SIGNING_ALLOWED: NO
+    ENABLE_DEBUG_DYLIB: NO
+    GENERATE_INFOPLIST_FILE: NO
+    SUPPORTS_MACCATALYST: NO
+    IPHONEOS_DEPLOYMENT_TARGET: '16.0'
+targets:
+  Suiyan:
+    type: application
+    platform: iOS
+    sources:
+      - App
+      - Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.suiyan.independent
+    info:
+      path: Generated/App-Info.plist
+      properties:
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleDisplayName: 随言键盘
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: false
+    dependencies:
+      - target: SuiyanKeyboard
+        embed: true
+  SuiyanKeyboard:
+    type: app-extension
+    platform: iOS
+    sources:
+      - Keyboard
+      - Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.suiyan.independent.keyboard
+        APPLICATION_EXTENSION_API_ONLY: YES
+        SKIP_INSTALL: YES
+    info:
+      path: Generated/Keyboard-Info.plist
+      properties:
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleDisplayName: 随言键盘
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.keyboard-service
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).KeyboardController
+          NSExtensionAttributes:
+            IsASCIICapable: false
+            PrefersRightToLeft: false
+            PrimaryLanguage: zh-Hans
+            RequestsOpenAccess: true
+schemes:
+  Suiyan:
+    build:
+      targets:
+        Suiyan: all
