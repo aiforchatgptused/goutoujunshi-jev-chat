@@ -31,14 +31,14 @@ jobs:
         run: |
           python3 tools_package.py
           cd build/package
-          ditto -c -k --keepParent Payload ../suiyan-independent-0.1.0-unsigned.ipa
+          ditto -c -k --keepParent Payload ../suiyan-independent-0.1.1-unsigned.ipa
           cd ..
-          shasum -a 256 suiyan-independent-0.1.0-unsigned.ipa > SHA256SUMS.txt
+          shasum -a 256 suiyan-independent-0.1.1-unsigned.ipa > SHA256SUMS.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: suiyan-independent-iphone-0.1.0
+          name: suiyan-independent-iphone-0.1.1
           path: |
-            standalone-keyboard/build/suiyan-independent-0.1.0-unsigned.ipa
+            standalone-keyboard/build/suiyan-independent-0.1.1-unsigned.ipa
             standalone-keyboard/build/SHA256SUMS.txt
             standalone-keyboard/TESTING.md
           if-no-files-found: error

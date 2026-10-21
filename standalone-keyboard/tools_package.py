@@ -10,8 +10,8 @@ assert len(list((app / 'PlugIns').glob('*.appex'))) == 1
 for bundle in [ext, app]:
     info = plistlib.loads((bundle / 'Info.plist').read_bytes())
     assert info['CFBundleSupportedPlatforms'] == ['iPhoneOS']
-    assert info['CFBundleShortVersionString'] == '0.1.0'
-    assert info['CFBundleVersion'] == '1'
+    assert info['CFBundleShortVersionString'] == '0.1.1'
+    assert info['CFBundleVersion'] == '2'
     assert 'GoutouAppGroup' not in info and 'GoutouKeychainGroup' not in info
     executable = bundle / info['CFBundleExecutable']
     subprocess.run(['lipo', str(executable), '-verify_arch', 'arm64'], check=True)

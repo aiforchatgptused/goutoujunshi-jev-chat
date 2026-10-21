@@ -3,6 +3,13 @@ import UIKit
 final class KeyboardController: UIInputViewController {
     private let stack = UIStackView()
     private let status = UILabel()
+    private let chatPanel = UIStackView()
+    private let importPanel = UIStackView()
+    private let configPreview = UITextView()
+    private var pendingConfig: KeyboardConfig?
+    private var pasteChange: Int?
+    private var pasteRequest = UUID()
+    private var deleteDeadline: Date?
     private let source = UITextView()
     private let result = UITextView()
     private var config: KeyboardConfig?
@@ -11,6 +18,7 @@ final class KeyboardController: UIInputViewController {
     private var output = ""
     override func viewDidLoad() {
         super.viewDidLoad()
+        pasteConfiguration = UIPasteConfiguration(forAccepting: NSString.self)
         view.backgroundColor = UIColor(red: 0.97, green: 0.95, blue: 0.92, alpha: 1)
         stack.axis = .vertical; stack.spacing = 6; stack.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(stack)
@@ -19,41 +27,64 @@ final class KeyboardController: UIInputViewController {
         row([("下一键盘", #selector(nextKeyboard)), ("收起", #selector(hide)), ("取消", #selector(cancel))], locked: false)
         status.font = .systemFont(ofSize: 12); status.numberOfLines = 3
         stack.addArrangedSubview(status)
-        row([("导入配置", #selector(importConfig)), ("测试连接", #selector(test)), ("删除配置", #selector(deleteConfig))])
+        row([("配置面板", #selector(importConfig)), ("测试连接", #selector(test)), ("删除配置", #selector(deleteConfig))])
+        for panel in [chatPanel, importPanel] { panel.axis = .vertical; panel.spacing = 6 }
+        stack.addArrangedSubview(chatPanel)
+        stack.addArrangedSubview(importPanel)
+        importPanel.isHidden = true
         for textView in [source, result] {
             textView.isEditable = false; textView.isSelectable = false
             textView.font = .systemFont(ofSize: 15); textView.layer.cornerRadius = 9
             textView.backgroundColor = .secondarySystemBackground
-            textView.heightAnchor.constraint(equalToConstant: 65).isActive = true
+            let size = textView.heightAnchor.constraint(equalToConstant: 65); size.priority = .defaultHigh; size.isActive = true
         }
         source.text = "先复制聊天文字，再点读取。原文只在本轮内存中暂存。"
-        stack.addArrangedSubview(source)
-        row([("读取聊天", #selector(readChat)), ("确认并生成", #selector(generate))])
+        chatPanel.addArrangedSubview(source)
+        row([("读取聊天", #selector(readChat)), ("确认并生成", #selector(generate))], into: chatPanel)
         result.text = "生成的回复会显示在这里。"
-        stack.addArrangedSubview(result)
-        row([("插入回复", #selector(insert)), ("清空本轮", #selector(clear))])
+        chatPanel.addArrangedSubview(result)
+        row([("插入回复", #selector(insert)), ("清空本轮", #selector(clear))], into: chatPanel)
+        let hint = UILabel()
+        hint.text = "在这里粘贴主 App 复制的完整配置，再确认保存。"
+        hint.font = .systemFont(ofSize: 13); hint.numberOfLines = 2
+        importPanel.addArrangedSubview(hint)
+        let pasteSettings = UIPasteControl.Configuration()
+        pasteSettings.displayMode = .iconAndLabel
+        let pasteButton = UIPasteControl(configuration: pasteSettings)
+        pasteButton.target = self
+        pasteButton.accessibilityLabel = "粘贴配置"
+        let pasteHeight = pasteButton.heightAnchor.constraint(equalToConstant: 40); pasteHeight.priority = .defaultHigh; pasteHeight.isActive = true
+        importPanel.addArrangedSubview(pasteButton)
+        configPreview.isEditable = false; configPreview.isSelectable = false
+        configPreview.font = .systemFont(ofSize: 13)
+        configPreview.backgroundColor = .secondarySystemBackground
+        configPreview.layer.cornerRadius = 9
+        let previewHeight = configPreview.heightAnchor.constraint(equalToConstant: 85); previewHeight.priority = .defaultHigh; previewHeight.isActive = true
+        configPreview.text = "尚未粘贴。此框显示接口、模型和风格，API Key 不回显。"
+        importPanel.addArrangedSubview(configPreview)
+        row([("确认保存", #selector(savePastedConfig)), ("返回聊天", #selector(closeConfig))], into: importPanel)
     }
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         do {
             config = try ConfigStore.keyboard().load()
-            status.text = !hasFullAccess ? "请先在系统设置开启允许完全访问，供键盘联网。" : (config == nil ? "首次使用：从主 App 复制配置，再点导入配置。" : "本机配置已读取 · \(config!.model) · 0.1.0 (1)")
+            status.text = !hasFullAccess ? "请先在系统设置开启允许完全访问，供键盘联网。" : (config == nil ? "首次使用：从主 App 复制配置，再打开配置面板。" : "本机配置已读取 · \(config!.model) · 0.1.1 (2)")
         } catch { config = nil; status.text = "配置读取失败：" + error.localizedDescription }
     }
     override func viewWillDisappear(_ animated: Bool) {
-        super.viewWillDisappear(animated); stop(); clearRound()
+        super.viewWillDisappear(animated); stop(); clearRound(); resetPaste(); deleteDeadline = nil
     }
-    private func row(_ items: [(String, Selector)], locked: Bool = true) {
+    private func row(_ items: [(String, Selector)], locked: Bool = true, into destination: UIStackView? = nil) {
         let row = UIStackView(); row.axis = .horizontal; row.distribution = .fillEqually; row.spacing = 5
         for (title, selector) in items {
             let button = UIButton(type: .system)
             button.setTitle(title, for: .normal); button.titleLabel?.font = .systemFont(ofSize: 14, weight: .semibold)
             button.backgroundColor = .tertiarySystemBackground; button.layer.cornerRadius = 8
             button.addTarget(self, action: selector, for: .touchUpInside)
-            button.heightAnchor.constraint(equalToConstant: 34).isActive = true
+            let size = button.heightAnchor.constraint(equalToConstant: 34); size.priority = .defaultHigh; size.isActive = true
             row.addArrangedSubview(button); if locked { controls.append(button) }
         }
-        stack.addArrangedSubview(row)
+        (destination ?? stack).addArrangedSubview(row)
     }
     private var transcript = ""
     private func fullAccess() -> Bool {
@@ -62,40 +93,69 @@ final class KeyboardController: UIInputViewController {
     @objc private func nextKeyboard() { advanceToNextInputMode() }
     @objc private func hide() { dismissKeyboard() }
     private func stop() { task?.cancel(); task = nil; controls.forEach { $0.isEnabled = true } }
-    @objc private func cancel() { stop(); status.text = "已取消；已经发出的请求可能仍产生服务商用量。" }
+    @objc private func cancel() { stop(); resetPaste(); deleteDeadline = nil; status.text = "已取消；已经发出的请求可能仍产生服务商用量。" }
+    private func resetPaste() {
+        pasteRequest = UUID(); pendingConfig = nil; pasteChange = nil
+        configPreview.text = "尚未粘贴。此框显示接口、模型和风格，API Key 不回显。"
+    }
     @objc private func importConfig() {
-        guard fullAccess() else { return }
-        do {
-            let board = UIPasteboard.general
-            let change = board.changeCount
-            guard let text = board.string, let data = text.data(using: .utf8) else { throw UserFailure("剪贴板没有配置，请到主 App 重新复制") }
-            let value = try KeyboardConfig.decode(data)
-            let alert = UIAlertController(title: "导入配置", message: "接口：\(try value.completionURL().absoluteString)\n模型：\(value.model)\n将覆盖键盘原有配置。Key 不显示。", preferredStyle: .alert)
-            alert.addAction(UIAlertAction(title: "取消", style: .cancel))
-            alert.addAction(UIAlertAction(title: "保存到键盘", style: .default) { [weak self] _ in
+        stop(); resetPaste(); deleteDeadline = nil
+        chatPanel.isHidden = true; importPanel.isHidden = false
+        status.text = "0.1.1 (2) · 点击下方粘贴按钮，检查配置后确认保存。"
+    }
+    @objc private func closeConfig() {
+        resetPaste(); importPanel.isHidden = true; chatPanel.isHidden = false
+        status.text = config == nil ? "尚未保存配置" : "本机配置可用 · \(config!.model)"
+    }
+    override func paste(itemProviders: [NSItemProvider]) {
+        guard !importPanel.isHidden, task == nil, fullAccess() else { return }
+        resetPaste()
+        let request = pasteRequest
+        let change = UIPasteboard.general.changeCount
+        guard let provider = itemProviders.first(where: { $0.canLoadObject(ofClass: NSString.self) }) else {
+            status.text = "没有可粘贴的文字，请从主 App 重新复制配置"; return
+        }
+        status.text = "正在读取配置…"
+        _ = provider.loadObject(ofClass: NSString.self) { [weak self] object, error in
+            let text = object as? String
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.pasteRequest == request, !self.importPanel.isHidden else { return }
                 do {
-                    let store = try ConfigStore.keyboard(); try store.save(value)
-                    guard try store.load() == value else { throw UserFailure("配置回读校验失败") }
-                    self?.config = value; self?.clearRound()
-                    if board.changeCount == change { board.items = [] }
-                    self?.status.text = "键盘独立保存并回读成功。请点测试连接。"
-                } catch { self?.status.text = "保存失败：" + error.localizedDescription }
-            })
-            present(alert, animated: true)
-        } catch { status.text = "导入失败：" + error.localizedDescription }
+                    guard error == nil, let text, let data = text.data(using: .utf8) else { throw UserFailure("无法读取文字，请重新复制配置") }
+                    let value = try KeyboardConfig.decode(data)
+                    self.pendingConfig = value; self.pasteChange = change
+                    self.configPreview.text = "接口：\(try value.completionURL().absoluteString)\n模型：\(value.model)\nAPI Key：已读取（隐藏）\n风格：\(value.style)"
+                    self.status.text = "粘贴成功，尚未保存。确认保存会替换键盘原配置。"
+                } catch { self.status.text = "配置无效：" + error.localizedDescription }
+            }
+        }
+    }
+    @objc private func savePastedConfig() {
+        guard fullAccess() else { return }
+        guard let value = pendingConfig else { status.text = "请先点粘贴，读取有效配置"; return }
+        do {
+            let store = try ConfigStore.keyboard(); try store.save(value)
+            guard try store.load() == value else { throw UserFailure("配置回读校验失败") }
+            config = value; clearRound()
+            if let change = pasteChange, UIPasteboard.general.changeCount == change { UIPasteboard.general.items = [] }
+            resetPaste(); importPanel.isHidden = true; chatPanel.isHidden = false
+            status.text = "键盘独立保存并回读成功。请点测试连接。"
+        } catch { status.text = "保存失败：" + error.localizedDescription }
     }
     @objc private func deleteConfig() {
-        let alert = UIAlertController(title: "删除键盘配置和 API Key？", message: "不会删除主 App。", preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "取消", style: .cancel))
-        alert.addAction(UIAlertAction(title: "删除", style: .destructive) { [weak self] _ in
-            do { try ConfigStore.keyboard().delete(); self?.config = nil; self?.clearRound(); self?.status.text = "配置已删除" }
-            catch { self?.status.text = error.localizedDescription }
-        }); present(alert, animated: true)
+        if let deadline = deleteDeadline, deadline > Date() {
+            deleteDeadline = nil
+            do { try ConfigStore.keyboard().delete(); config = nil; resetPaste(); clearRound(); status.text = "配置已删除" }
+            catch { status.text = error.localizedDescription }
+        } else {
+            deleteDeadline = Date().addingTimeInterval(5)
+            status.text = "要删除键盘配置和 Key，请在 5 秒内再次点删除配置；否则不删除。"
+        }
     }
     @objc private func readChat() {
         guard fullAccess() else { return }
         guard let text = UIPasteboard.general.string, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { status.text = "剪贴板没有文字"; return }
-        guard !KeyboardConfig.isConfig(text) else { status.text = "剪贴板里是配置。请点导入配置，不会将 Key 发送给 AI。"; return }
+        guard !KeyboardConfig.isConfig(text) else { status.text = "剪贴板里是配置。请打开配置面板粘贴，不会将 Key 发送给 AI。"; return }
         guard text.count <= 12000 else { status.text = "聊天文字最多 12000 字，请减少内容"; return }
         transcript = text; source.text = text; output = ""; result.text = "核对上方原文，再点确认并生成。"
         status.text = "原文已读取，尚未发送。生成时原文与风格会发送给已配置的 AI 服务。"
@@ -104,6 +164,7 @@ final class KeyboardController: UIInputViewController {
     @objc private func generate() { request(test: false) }
     private func request(test: Bool) {
         guard fullAccess(), task == nil else { return }
+        resetPaste(); deleteDeadline = nil
         guard let config else { status.text = "请先导入配置"; return }
         do { _ = try ReplyRules.messages(text: transcript, style: config.style, test: test) }
         catch { status.text = error.localizedDescription; return }

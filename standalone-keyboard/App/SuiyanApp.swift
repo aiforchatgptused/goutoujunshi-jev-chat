@@ -17,7 +17,7 @@ struct SetupView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("独立键盘验证版 · 0.1.0 (1)") {
+                Section("独立键盘验证版 · 0.1.1 (2)") {
                     Text("配置由键盘独立保存，键盘直接调用 AI。无需 App Group、共享钥匙串或服务器。")
                     Text("这是 AI 回复面板，日常打字请切换系统键盘。")
                 }
@@ -35,7 +35,7 @@ struct SetupView: View {
                 }
                 Section("3 · 在这里切换到随言键盘") {
                     TextField("点这里，再长按地球键切换键盘", text: $testText, axis: .vertical).lineLimit(3...6)
-                    Text("首次点键盘内的“导入配置”，确认接口后保存，再点“测试连接”。以后修改配置时重复导入。")
+                    Text("首次点键盘内的“配置面板”，再点“粘贴”，检查配置后确认保存，再点“测试连接”。以后修改配置时重复导入。")
                 }
                 Section("日常使用") {
                     Text("复制聊天文字 → 切换随言键盘 → 读取聊天 → 确认并生成 → 插入回复。不会自动读取或发送剪贴板，也不会自动发消息。")
@@ -57,7 +57,7 @@ struct SetupView: View {
             guard let string = String(data: data, encoding: .utf8) else { throw UserFailure("无法编码配置") }
             UIPasteboard.general.setItems([["public.utf8-plain-text": string]], options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(90)])
             key = ""; focused = false
-            status = "已复制。请立即切换到随言键盘，点导入配置。"
+            status = "已复制。请立即切换到随言键盘，打开配置面板，粘贴并确认保存。"
         } catch { status = error.localizedDescription }
     }
 }
